@@ -1,0 +1,58 @@
+[project]
+name = "industrial-rag-system"
+version = "0.1.0"
+description = "Industrial Technical Document RAG System"
+requires-python = ">=3.11"
+dependencies = [
+    # 핵심 LlamaIndex (2025년 최신 구조)
+    "llama-index-core>=0.12.0",
+    "llama-index-llms-openai>=0.3.0",
+    "llama-index-llms-ollama>=0.4.0",
+    "llama-index-embeddings-huggingface>=0.3.0",
+    "llama-index-vector-stores-chroma>=0.3.0",
+    "llama-index-readers-file>=0.3.0",
+
+    # FastAPI 스택
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.31.0",
+    "python-multipart>=0.0.12",
+
+    # 문서 처리
+    "unstructured[pdf]>=0.15.0",
+    "pypdf>=5.1.0",
+    "python-docx>=1.1.2",
+
+    # 임베딩 및 벡터 DB
+    "chromadb>=0.5.0",
+    "sentence-transformers>=3.0.0",
+
+    # 기타 필수
+    "python-dotenv>=1.0.1",
+    "pydantic>=2.9.0",
+    "httpx>=0.27.0",
+    "aiofiles>=24.1.0",
+]
+
+[project.optional-dependencies]
+frontend = [
+    "streamlit>=1.40.0",
+    "plotly>=5.24.0",
+]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "black>=24.8.0",
+    "ruff>=0.7.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.black]
+line-length = 88
+target-version = ['py311']
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
