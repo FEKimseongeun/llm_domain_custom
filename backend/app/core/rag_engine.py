@@ -2,12 +2,16 @@ from llama_index.core import SimpleDirectoryReader, Settings as LlamaSettings
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.llms.ollama import Ollama
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import logging
 import os
 import re
 import json
 from collections import defaultdict
+
+# 프롬프트 임포트
+from .prompts import CATEGORY_PROMPTS, NO_CONTEXT_RESPONSES
+from ..config import TECHNICAL_GLOSSARY
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +26,7 @@ class SimpleDocumentStore:
 
         self.documents = []
         self.keyword_index = defaultdict(set)
+        self.technical_term_index = defaultdict(set)  # 기술 용어 전용 인덱스
 
         # 기존 데이터 로드
         self._load_data()
@@ -55,12 +60,35 @@ class SimpleDocumentStore:
         except Exception as e:
             logger.error(f"Error saving data for {self.category}: {e}")
 
+    def _extract_technical_terms(self, text: str) -> List[str]:
+        """카테고리별 기술 용어 추출"""
+        terms = []
+        text_lower = text.lower()
+
+        # 카테고리별 기술 용어 검색
+        if self.category in TECHNICAL_GLOSSARY:
+            for term in TECHNICAL_GLOSSARY[self.category]:
+                if term.lower() in text_lower:
+                    terms.append(term.lower())
+
+        return terms
+
     def _index_document(self, text: str, doc_id: int):
-        """문서를 키워드로 인덱싱"""
-        # 영어 단어 추출 (3글자 이상)
+        """문서를 키워드로 인덱싱 (개선된 버전)"""
+        # 일반 영어 단어 추출 (3글자 이상)
         words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())
         for word in set(words):
             self.keyword_index[word].add(doc_id)
+
+        # 기술 용어 인덱싱
+        technical_terms = self._extract_technical_terms(text)
+        for term in technical_terms:
+            self.technical_term_index[term].add(doc_id)
+
+        # 숫자가 포함된 용어도 인덱싱 (예: B31.3, API650)
+        alphanumeric = re.findall(r'\b[A-Z]+[\d]+[\.\d]*\b', text.upper())
+        for term in set(alphanumeric):
+            self.keyword_index[term.lower()].add(doc_id)
 
     def add_document(self, text: str, metadata: dict):
         """문서 추가"""
@@ -77,19 +105,31 @@ class SimpleDocumentStore:
         self._save_data()
 
     def search(self, query: str, top_k: int = 5) -> List[Dict]:
-        """키워드 기반 검색"""
+        """개선된 키워드 기반 검색"""
         if not self.documents:
             return []
 
-        query_words = re.findall(r'\b[a-zA-Z]{3,}\b', query.lower())
-        if not query_words:
+        query_lower = query.lower()
+
+        # 쿼리에서 일반 단어와 기술 용어 추출
+        query_words = re.findall(r'\b[a-zA-Z]{3,}\b', query_lower)
+        technical_terms = self._extract_technical_terms(query)
+
+        if not query_words and not technical_terms:
             return []
 
-        # 문서별 점수 계산
-        doc_scores = defaultdict(int)
+        # 문서별 점수 계산 (기술 용어에 더 높은 가중치)
+        doc_scores = defaultdict(float)
+
+        # 일반 단어 매칭 (가중치 1.0)
         for word in query_words:
             for doc_id in self.keyword_index.get(word, set()):
-                doc_scores[doc_id] += 1
+                doc_scores[doc_id] += 1.0
+
+        # 기술 용어 매칭 (가중치 2.0)
+        for term in technical_terms:
+            for doc_id in self.technical_term_index.get(term, set()):
+                doc_scores[doc_id] += 2.0
 
         # 점수 순 정렬
         sorted_docs = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)
@@ -102,7 +142,8 @@ class SimpleDocumentStore:
                 results.append({
                     'text': doc['text'],
                     'metadata': doc['metadata'],
-                    'score': score / len(query_words)
+                    'score': score / (
+                                len(query_words) + len(technical_terms) * 2) if query_words or technical_terms else 0
                 })
 
         return results
@@ -112,11 +153,12 @@ class SimpleDocumentStore:
 
 
 class IndustrialRAGEngine:
-    """산업용 문서 RAG 엔진 - 키워드 검색 기반"""
+    """산업용 문서 RAG 엔진 - 개선된 버전"""
 
     def __init__(self, config):
         self.config = config
-        self.categories = ["procurement", "piping", "process", "mechanical"]
+        # 5개 카테고리로 확장
+        self.categories = ["bim", "process", "piping", "procurement", "mechanical"]
         self.document_stores: Dict[str, SimpleDocumentStore] = {}
 
         # 필요한 디렉토리 생성
@@ -143,8 +185,10 @@ class IndustrialRAGEngine:
             llm = Ollama(
                 model=self.config.ollama_model,
                 base_url=self.config.ollama_host,
-                temperature=0.2,
-                request_timeout=300.0
+                temperature=0.1,  # 더 일관된 답변을 위해 낮춤
+                request_timeout=300.0,
+                context_window=4096,  # 컨텍스트 윈도우 명시
+                num_predict=1024  # 답변 길이 제한
             )
 
             # LLM 연결 테스트
@@ -191,15 +235,24 @@ class IndustrialRAGEngine:
                 recursive=True
             ).load_data()
 
+            # 문서를 청크로 분할
+            node_parser = LlamaSettings.node_parser
+
             # 문서 저장소에 추가
             store = self.document_stores[category]
             for doc in documents:
-                metadata = {
-                    "category": category,
-                    "source": str(doc.metadata.get("file_path", "unknown")),
-                    "file_name": os.path.basename(str(doc.metadata.get("file_path", "unknown")))
-                }
-                store.add_document(doc.text, metadata)
+                # 문서를 청크로 분할
+                chunks = node_parser.split_text(doc.text)
+
+                for i, chunk in enumerate(chunks):
+                    metadata = {
+                        "category": category,
+                        "source": str(doc.metadata.get("file_path", "unknown")),
+                        "file_name": os.path.basename(str(doc.metadata.get("file_path", "unknown"))),
+                        "chunk_id": i,
+                        "total_chunks": len(chunks)
+                    }
+                    store.add_document(chunk, metadata)
 
             logger.info(f"Successfully added {len(documents)} documents to {category}")
             return {
@@ -212,8 +265,35 @@ class IndustrialRAGEngine:
             logger.error(f"Error adding documents to {category}: {e}")
             raise
 
-    async def query(self, category: str, question: str, top_k: int = 1) -> Dict[str, Any]:
-        """카테고리별 질의응답"""
+    def _prepare_context(self, search_results: List[Dict], max_context_length: int = 3000) -> str:
+        """컨텍스트 준비 및 최적화"""
+        if not search_results:
+            return ""
+
+        context_parts = []
+        current_length = 0
+
+        for i, result in enumerate(search_results):
+            text = result['text']
+            metadata = result['metadata']
+
+            # 컨텍스트 길이 제한
+            if current_length + len(text) > max_context_length:
+                remaining = max_context_length - current_length
+                if remaining > 100:  # 최소 100자는 포함
+                    text = text[:remaining] + "..."
+                else:
+                    break
+
+            # 소스 정보와 함께 컨텍스트 구성
+            context_part = f"[Source: {metadata.get('file_name', 'unknown')}]\n{text}"
+            context_parts.append(context_part)
+            current_length += len(text)
+
+        return "\n\n---\n\n".join(context_parts)
+
+    async def query(self, category: str, question: str, top_k: int = 5) -> Dict[str, Any]:
+        """개선된 카테고리별 질의응답"""
         if category not in self.categories:
             raise ValueError(f"Invalid category. Must be one of: {self.categories}")
 
@@ -225,48 +305,42 @@ class IndustrialRAGEngine:
             search_results = store.search(question, top_k)
 
             if not search_results:
+                # 카테고리별 맞춤 응답
+                no_context_response = NO_CONTEXT_RESPONSES.get(
+                    category,
+                    f"Sorry, I couldn't find relevant documents in the {category} category."
+                )
+
                 return {
-                    "answer": f"Sorry, I couldn't find relevant documents in the {category} category for your question. Please make sure documents are uploaded or try rephrasing your question.",
+                    "answer": no_context_response,
                     "sources": [],
                     "category": category,
                     "question": question
                 }
 
-            # 검색된 문서들을 컨텍스트로 사용
-            context_texts = []
-            sources = []
+            # 컨텍스트 준비
+            context = self._prepare_context(search_results)
 
-            for result in search_results:
-                # 텍스트를 적절한 크기로 자르기
-                text = result['text'][:800]  # 800자로 제한
-                context_texts.append(text)
+            # 카테고리별 특화 프롬프트 선택
+            prompt_template = CATEGORY_PROMPTS.get(category, CATEGORY_PROMPTS["process"])
 
-                sources.append({
-                    "source": result['metadata'].get('file_name', 'unknown'),
-                    "score": float(result['score']),
-                    "content_preview": text[:200] + "..." if len(text) > 200 else text
-                })
-
-            # LLM 프롬프트 구성
-            context = "\n\n---\n\n".join(context_texts)
-            prompt = f"""You are an industrial technical document assistant. Based on the following context from {category} documents, please provide a comprehensive and accurate answer to the question.
-
-Context from {category} documents:
-{context}
-
-Question: {question}
-
-Instructions:
-- Provide a detailed, technical answer based on the context
-- If specific technical specifications, procedures, or requirements are mentioned in the context, include them
-- If the context doesn't contain sufficient information, mention what information is missing
-- Use professional engineering terminology appropriate for the {category} domain
-- Structure your answer clearly with relevant details
-
-Answer:"""
+            # 프롬프트 생성
+            prompt = prompt_template.format(
+                context=context,
+                question=question
+            )
 
             # LLM으로 답변 생성
             response = LlamaSettings.llm.complete(prompt)
+
+            # 소스 정보 구성
+            sources = []
+            for result in search_results:
+                sources.append({
+                    "source": result['metadata'].get('file_name', 'unknown'),
+                    "score": float(result['score']),
+                    "content_preview": result['text'][:200] + "..." if len(result['text']) > 200 else result['text']
+                })
 
             result = {
                 "answer": str(response),
@@ -319,7 +393,7 @@ Answer:"""
             return {
                 "status": llm_status,
                 "llm_status": llm_status,
-                "search_type": "keyword_based",
+                "search_type": "keyword_based_enhanced",  # 개선된 키워드 검색
                 "categories": list(self.categories),
                 "stores_loaded": len(self.document_stores),
                 "ollama_host": self.config.ollama_host,

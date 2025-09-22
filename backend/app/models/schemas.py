@@ -3,12 +3,12 @@ from typing import List, Optional
 from enum import Enum
 
 class CategoryEnum(str, Enum):
-    """문서 카테고리 열거형"""
-    PROCUREMENT = "procurement"
-    PIPING = "piping"
+    """문서 카테고리 열거형 - 5개로 확장"""
+    BIM = "bim"
     PROCESS = "process"
+    PIPING = "piping"
+    PROCUREMENT = "procurement"
     MECHANICAL = "mechanical"
-
 class QueryRequest(BaseModel):
     """질의 요청 모델"""
     category: CategoryEnum = Field(..., description="Document category")

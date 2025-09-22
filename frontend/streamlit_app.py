@@ -1,179 +1,303 @@
 import streamlit as st
-import httpx
+from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
+import torch
+from pathlib import Path
+import json
+import re
+from collections import defaultdict
+from typing import List, Dict, Any
+import tempfile
 import os
-from typing import Dict, Any, List
 
 # 설정
-BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
-
 st.set_page_config(
     page_title="Industrial RAG Assistant",
     page_icon="🏭",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-# 커스텀 CSS
-st.markdown("""
-<style>
-    .main > div {
-        padding-top: 2rem;
-    }
-    .source-box {
-        background-color: #f0f2f6;
-        padding: 10px;
-        border-radius: 5px;
-        margin: 5px 0;
-    }
-</style>
-""", unsafe_allow_html=True)
 
-
-def check_backend_connection():
-    """백엔드 연결 확인"""
+@st.cache_resource
+def load_llm_model():
+    """경량 LLM 모델 로드 (캐시됨)"""
     try:
-        response = httpx.get(f"{BACKEND_URL}/health", timeout=5.0)
-        return response.status_code == 200
+        # 매우 가벼운 모델 (Streamlit Cloud 호환)
+        model_name = "distilgpt2"  # 약 300MB만 사용
+
+        with st.spinner("Loading AI model... (first time only)"):
+            # 모델과 토크나이저 로드
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model = AutoModelForCausalLM.from_pretrained(model_name)
+
+            # 패딩 토큰 설정
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+
+            # 텍스트 생성 파이프라인
+            generator = pipeline(
+                "text-generation",
+                model=model,
+                tokenizer=tokenizer,
+                device=0 if torch.cuda.is_available() else -1,  # GPU 사용 가능하면 사용
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+            )
+
+            return generator
+    except Exception as e:
+        st.error(f"Model loading failed: {e}")
+        return None
+
+
+@st.cache_resource
+def load_simple_model():
+    """더 간단한 모델 (fallback)"""
+    try:
+        # 매우 가벼운 모델
+        return pipeline("text-generation", model="distilgpt2", device=-1)
     except:
-        return False
+        return None
 
 
-def load_categories():
-    """카테고리 정보 로드"""
-    try:
-        response = httpx.get(f"{BACKEND_URL}/api/v1/chat/categories", timeout=10.0)
-        if response.status_code == 200:
-            return response.json()["categories"]
-        else:
-            st.error(f"Failed to load categories: {response.status_code}")
+class SimpleDocumentStore:
+    """간단한 문서 저장 및 검색"""
+
+    def __init__(self, category: str):
+        self.category = category
+        self.documents = []
+        self.keyword_index = defaultdict(set)
+
+        # 세션 상태에서 로드
+        if f"docs_{category}" in st.session_state:
+            self.documents = st.session_state[f"docs_{category}"]
+            self._rebuild_index()
+
+    def _rebuild_index(self):
+        """키워드 인덱스 재구성"""
+        self.keyword_index = defaultdict(set)
+        for i, doc in enumerate(self.documents):
+            self._index_document(doc['text'], i)
+
+    def _index_document(self, text: str, doc_id: int):
+        """문서를 키워드로 인덱싱"""
+        words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())
+        for word in set(words):
+            self.keyword_index[word].add(doc_id)
+
+    def add_document(self, text: str, metadata: dict):
+        """문서 추가"""
+        doc_id = len(self.documents)
+        self.documents.append({
+            'text': text,
+            'metadata': metadata
+        })
+
+        # 키워드 인덱싱
+        self._index_document(text, doc_id)
+
+        # 세션 상태에 저장
+        st.session_state[f"docs_{self.category}"] = self.documents
+
+    def search(self, query: str, top_k: int = 3) -> List[Dict]:
+        """키워드 기반 검색"""
+        if not self.documents:
             return []
-    except Exception as e:
-        st.error(f"Cannot connect to backend: {e}")
-        return []
+
+        query_words = re.findall(r'\b[a-zA-Z]{3,}\b', query.lower())
+        if not query_words:
+            return []
+
+        # 문서별 점수 계산
+        doc_scores = defaultdict(int)
+        for word in query_words:
+            for doc_id in self.keyword_index.get(word, set()):
+                doc_scores[doc_id] += 1
+
+        # 점수 순 정렬
+        sorted_docs = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)
+
+        # 상위 결과 반환
+        results = []
+        for doc_id, score in sorted_docs[:top_k]:
+            if score > 0:
+                doc = self.documents[doc_id]
+                results.append({
+                    'text': doc['text'],
+                    'metadata': doc['metadata'],
+                    'score': score / len(query_words)
+                })
+
+        return results
+
+    def get_document_count(self) -> int:
+        return len(self.documents)
 
 
-def upload_documents(category: str, files: List) -> Dict[str, Any]:
-    """문서 업로드"""
+def extract_text_from_file(uploaded_file) -> str:
+    """업로드된 파일에서 텍스트 추출"""
     try:
-        files_data = []
-        for uploaded_file in files:
-            files_data.append(("files", (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)))
+        if uploaded_file.type == "text/plain":
+            return str(uploaded_file.read(), "utf-8")
+        elif uploaded_file.type == "application/pdf":
+            try:
+                import PyPDF2
+                reader = PyPDF2.PdfReader(uploaded_file)
+                text = ""
+                for page in reader.pages:
+                    text += page.extract_text()
+                return text
+            except:
+                return "PDF processing not available. Please upload as text file."
+        else:
+            # 기본적으로 텍스트로 읽기 시도
+            return str(uploaded_file.read(), "utf-8")
+    except Exception as e:
+        return f"Error reading file: {e}"
 
-        response = httpx.post(
-            f"{BACKEND_URL}/api/v1/documents/upload",
-            data={"category": category},
-            files=files_data,
-            timeout=60.0
+
+def generate_answer_with_local_llm(question: str, context: str, category: str, generator) -> str:
+    """로컬 LLM으로 답변 생성"""
+    if not generator:
+        return "AI model not available. Please check the setup."
+
+    # 프롬프트 구성 (짧게 유지)
+    prompt = f"""Context: {context[:500]}...
+
+Question: {question}
+
+Answer based on the context above:"""
+
+    try:
+        # 텍스트 생성
+        result = generator(
+            prompt,
+            max_length=len(prompt.split()) + 100,  # 입력 + 100 토큰
+            num_return_sequences=1,
+            temperature=0.7,
+            do_sample=True,
+            pad_token_id=generator.tokenizer.eos_token_id
         )
 
-        if response.status_code == 200:
-            return response.json()
-        else:
-            return {"error": f"Upload failed: {response.status_code} - {response.text}"}
+        # 생성된 텍스트에서 답변 부분만 추출
+        generated_text = result[0]['generated_text']
+        answer = generated_text[len(prompt):].strip()
+
+        if not answer:
+            return "Based on the documents, I found relevant information but couldn't generate a complete answer. Please try rephrasing your question."
+
+        return answer
+
     except Exception as e:
-        return {"error": str(e)}
+        return f"Error generating answer: {e}"
 
 
-def query_documents(category: str, question: str, top_k: int = 5) -> Dict[str, Any]:
-    """문서 질의"""
-    try:
-        response = httpx.post(
-            f"{BACKEND_URL}/api/v1/chat",
-            json={
-                "category": category,
-                "question": question,
-                "top_k": top_k
-            },
-            timeout=120.0
-        )
-
-        if response.status_code == 200:
-            return response.json()
-        else:
-            return {"error": f"Query failed: {response.status_code} - {response.text}"}
-    except Exception as e:
-        return {"error": str(e)}
+def generate_simple_answer(question: str, context: str) -> str:
+    """간단한 규칙 기반 답변 (fallback)"""
+    # 키워드 매칭으로 간단한 답변 생성
+    sentences = context.split('.')[:3]  # 처음 3문장
+    answer = ". ".join(sentences) + "."
+    return f"Based on the documents: {answer}"
 
 
 def main():
-    """메인 애플리케이션"""
+    st.title("🏭 Industrial Document Assistant")
+    st.markdown("**Free AI-powered document search** (no API costs!)")
 
-    st.title("🏭 EPC 전용 Document Assistant")
-    st.markdown("Ask questions about your technical documents")
-
-    # 백엔드 연결 확인
-    if not check_backend_connection():
-        st.error("⚠️ Cannot connect to backend server. Please make sure the server is running.")
-        st.info("Run the backend with: `python -m app.main` in the backend directory")
-        return
-
-    # 사이드바 설정
+    # AI 모델 로드
     with st.sidebar:
-        st.header("📋 Document Categories")
+        st.header("🤖 AI Model Status")
 
-        # 카테고리 로드
-        categories = load_categories()
-        if not categories:
-            st.error("No categories available")
-            return
+        # 모델 선택
+        model_option = st.selectbox(
+            "AI Model:",
+            ["Local AI (Free)", "Simple Search Only"]
+        )
+
+        if model_option == "Local AI (Free)":
+            generator = load_llm_model()
+            if not generator:
+                generator = load_simple_model()
+                if generator:
+                    st.warning("Using basic model")
+                else:
+                    st.error("AI model failed to load")
+        else:
+            generator = None
+            st.info("Using keyword search only")
+
+        st.markdown("---")
 
         # 카테고리 선택
-        category_options = {}
-        for cat in categories:
-            status_emoji = "✅" if cat["is_available"] else "❌"
-            category_options[cat["id"]] = f"{status_emoji} {cat['name']} ({cat['document_count']} docs)"
+        categories = {
+            "procurement": "Procurement/Contract",
+            "piping": "Piping",
+            "process": "Process",
+            "mechanical": "Mechanical"
+        }
 
         selected_category = st.selectbox(
-            "Select category:",
-            options=list(category_options.keys()),
-            format_func=lambda x: category_options[x]
+            "Document Category:",
+            options=list(categories.keys()),
+            format_func=lambda x: categories[x]
         )
 
-        # 선택된 카테고리 정보
-        selected_cat_info = next(cat for cat in categories if cat["id"] == selected_category)
-        st.info(f"**{selected_cat_info['name']}**\n\n{selected_cat_info['description']}")
+        st.markdown("---")
 
-        # 문서 업로드 섹션
+        # 문서 업로드
         st.header("📤 Upload Documents")
         uploaded_files = st.file_uploader(
-            "Upload technical documents",
+            "Upload files",
             accept_multiple_files=True,
-            type=['pdf', 'docx', 'doc', 'txt', 'md'],
-            help="Supported formats: PDF, DOCX, DOC, TXT, MD"
+            type=['txt', 'md'],
+            help="Supported: TXT, MD files"
         )
 
-        if uploaded_files and st.button("Process Documents", type="primary"):
-            with st.spinner("Processing documents..."):
-                result = upload_documents(selected_category, uploaded_files)
+        if uploaded_files and st.button("Process Documents"):
+            store = SimpleDocumentStore(selected_category)
 
-                if "error" in result:
-                    st.error(f"Upload failed: {result['error']}")
-                else:
-                    st.success(f"✅ Successfully uploaded {result['documents_added']} documents!")
-                    st.rerun()
+            progress_bar = st.progress(0)
+            processed = 0
 
-        # 시스템 통계
-        st.header("📊 System Stats")
-        try:
-            stats_response = httpx.get(f"{BACKEND_URL}/api/v1/stats", timeout=10.0)
-            if stats_response.status_code == 200:
-                stats = stats_response.json()
+            for i, uploaded_file in enumerate(uploaded_files):
+                text = extract_text_from_file(uploaded_file)
+                if text.strip() and len(text) > 10:
+                    metadata = {
+                        "category": selected_category,
+                        "file_name": uploaded_file.name,
+                        "file_type": uploaded_file.type
+                    }
+                    store.add_document(text, metadata)
+                    processed += 1
 
-                st.metric("Total Documents", stats["total_documents"])
+                progress_bar.progress((i + 1) / len(uploaded_files))
 
-                for category, data in stats["categories"].items():
-                    if data["document_count"] > 0:
-                        st.metric(
-                            category.capitalize(),
-                            data["document_count"]
-                        )
-            else:
-                st.warning("Stats unavailable")
-        except:
-            st.warning("Could not load stats")
+            st.success(f"✅ Processed {processed} documents!")
+            st.rerun()
+
+        # 통계 표시
+        st.header("📊 Document Stats")
+        for category, name in categories.items():
+            if f"docs_{category}" in st.session_state:
+                count = len(st.session_state[f"docs_{category}"])
+                if count > 0:
+                    st.metric(name, count)
 
     # 메인 채팅 인터페이스
     st.header("💬 Chat with Documents")
+
+    # 도움말
+    with st.expander("ℹ️ How it works", expanded=False):
+        st.markdown("""
+        **This app runs completely free!**
+
+        - **No API costs**: Uses local AI models
+        - **Private**: Your documents stay on your device
+        - **Simple**: Upload documents and ask questions
+
+        **Tips:**
+        - Upload text files for best results
+        - Ask specific questions about your documents
+        - The AI model loads once and stays cached
+        """)
 
     # 세션 상태 초기화
     if "messages" not in st.session_state:
@@ -184,23 +308,19 @@ def main():
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-            # 소스 정보 표시
             if message["role"] == "assistant" and "sources" in message:
                 if message["sources"]:
-                    with st.expander("📄 Source Documents", expanded=False):
+                    with st.expander("📄 Sources", expanded=False):
                         for i, source in enumerate(message["sources"], 1):
-                            st.markdown(f"""
-                            <div class="source-box">
-                                <strong>{i}. {source['source']}</strong> (Score: {source['score']:.3f})<br>
-                                <small>{source['content_preview']}</small>
-                            </div>
-                            """, unsafe_allow_html=True)
+                            st.markdown(f"**{i}. {source['file_name']}** (Score: {source['score']:.3f})")
+                            st.markdown(f"*{source['preview']}*")
 
     # 사용자 입력
-    if prompt := st.chat_input("Ask about your technical documents..."):
-        # 카테고리에 문서가 있는지 확인
-        if not selected_cat_info["is_available"]:
-            st.error(f"No documents available in {selected_cat_info['name']} category. Please upload documents first.")
+    if prompt := st.chat_input("Ask about your documents..."):
+        # 문서 확인
+        store = SimpleDocumentStore(selected_category)
+        if store.get_document_count() == 0:
+            st.error(f"No documents in {categories[selected_category]} category. Please upload documents first.")
             return
 
         # 사용자 메시지 추가
@@ -208,40 +328,57 @@ def main():
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # 어시스턴트 응답 생성
+        # 어시스턴트 응답
         with st.chat_message("assistant"):
             with st.spinner("Searching documents..."):
-                result = query_documents(selected_category, prompt, top_k=5)
+                # 문서 검색
+                search_results = store.search(prompt, top_k=3)
 
-                if "error" in result:
-                    error_msg = f"Sorry, I encountered an error: {result['error']}"
-                    st.error(error_msg)
-                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
+                if not search_results:
+                    response = f"No relevant documents found in {categories[selected_category]} category."
+                    sources = []
                 else:
-                    # 답변 표시
-                    st.markdown(result["answer"])
+                    # 컨텍스트 구성
+                    context_texts = []
+                    sources = []
 
-                    # 소스 문서 표시
-                    if result["sources"]:
-                        with st.expander("📄 Source Documents", expanded=False):
-                            for i, source in enumerate(result["sources"], 1):
-                                st.markdown(f"""
-                                <div class="source-box">
-                                    <strong>{i}. {source['source']}</strong> (Score: {source['score']:.3f})<br>
-                                    <small>{source['content_preview']}</small>
-                                </div>
-                                """, unsafe_allow_html=True)
+                    for result in search_results:
+                        text = result['text'][:600]  # 토큰 제한으로 짧게
+                        context_texts.append(text)
+                        sources.append({
+                            'file_name': result['metadata']['file_name'],
+                            'score': result['score'],
+                            'preview': text[:200] + "..." if len(text) > 200 else text
+                        })
 
-                    # 메시지 저장
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": result["answer"],
-                        "sources": result["sources"]
-                    })
+                    context = "\n\n---\n\n".join(context_texts)
 
-    # 채팅 초기화 버튼
+                    # AI 모델로 답변 생성
+                    if generator and model_option == "Local AI (Free)":
+                        response = generate_answer_with_local_llm(prompt, context, categories[selected_category],
+                                                                  generator)
+                    else:
+                        response = generate_simple_answer(prompt, context)
+
+                st.markdown(response)
+
+                # 소스 표시
+                if sources:
+                    with st.expander("📄 Sources", expanded=False):
+                        for i, source in enumerate(sources, 1):
+                            st.markdown(f"**{i}. {source['file_name']}** (Score: {source['score']:.3f})")
+                            st.markdown(f"*{source['preview']}*")
+
+                # 메시지 저장
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": response,
+                    "sources": sources
+                })
+
+    # 채팅 초기화
     if st.session_state.messages:
-        if st.button("🗑️ Clear Chat History"):
+        if st.button("🗑️ Clear Chat"):
             st.session_state.messages = []
             st.rerun()
 

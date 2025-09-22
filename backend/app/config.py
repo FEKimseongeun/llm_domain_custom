@@ -28,26 +28,49 @@ class Settings(BaseSettings):
 # 전역 설정 인스턴스
 settings = Settings()
 
-# 문서 카테고리 정의
+# 문서 카테고리 정의 - 5개로 확장
 DOCUMENT_CATEGORIES = {
-    "procurement": {
-        "name": "Procurement/Contract",
-        "description": "Purchase orders, contracts, specifications",
-        "folder": "procurement"
-    },
-    "piping": {
-        "name": "Piping",
-        "description": "Piping designs, isometrics, specs",
-        "folder": "piping"
+    "bim": {
+        "name": "3D/BIM",
+        "description": "3D models, BIM coordination, clash detection reports, LOD specifications",
+        "folder": "bim"
     },
     "process": {
         "name": "Process",
-        "description": "P&ID drawings, process flow diagrams",
+        "description": "P&ID drawings, PFDs, heat & material balance, HAZOP studies",
         "folder": "process"
+    },
+    "piping": {
+        "name": "Piping",
+        "description": "Piping specs, isometrics, stress analysis, support drawings",
+        "folder": "piping"
+    },
+    "procurement": {
+        "name": "Procurement/Contract",
+        "description": "Purchase orders, contracts, vendor lists, bidding documents",
+        "folder": "procurement"
     },
     "mechanical": {
         "name": "Mechanical",
-        "description": "Equipment datasheets, vendor prints",
+        "description": "Equipment datasheets, pump curves, compressor specs, maintenance manuals",
         "folder": "mechanical"
     }
+}
+
+# EPC 기술 용어 사전
+TECHNICAL_GLOSSARY = {
+    "bim": ["LOD", "clash", "navisworks", "revit", "coordination", "3D model", "digital twin",
+            "federated model", "IFC", "BCF", "COBie", "E3D", "S3D", "Smart3D", "Everything3D", "HEXAGON", "AVEVA"],
+
+    "process": ["P&ID", "PFD", "HAZOP", "SIL", "heat balance", "mass balance", "flow rate",
+                "pressure drop", "control valve", "PSV", "instrumentation", "DCS", "ESD"],
+
+    "piping": ["schedule", "ASME B31.3", "isometric", "stress analysis", "pipe support",
+               "flange", "welding", "NPS", "pipe spec", "branch connection", "tie-in"],
+
+    "procurement": ["RFQ", "RFP", "bid evaluation", "vendor", "INCOTERMS", "L/C",
+                    "performance bond", "warranty", "expediting", "inspection", "FAT", "SAT"],
+
+    "mechanical": ["API", "ASME", "vibration", "bearing", "seal", "impeller", "NPSH",
+                   "pump curve", "compressor", "heat exchanger", "vessel", "rotating equipment"]
 }
